@@ -1,0 +1,10 @@
+# Search-OPD Muon optimizer. Requires PYTHONPATH to include the repository's code directory.
+_target_: verl.workers.config.FSDPOptimizerConfig
+optimizer: SearchOPDMuon
+optimizer_impl: muon
+lr: 1e-3
+lr_warmup_steps_ratio: 0.0
+weight_decay: 0.1
+num_cycles: 0.5
+warmup_style: constant
+total_training_steps: null

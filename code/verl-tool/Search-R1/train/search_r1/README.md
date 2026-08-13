@@ -52,12 +52,12 @@ need to wait for 5 mins
 
 ### Step 3: prepare the training dataset
 ```bash
-python examples/data_preprocess/search_r1.py --local_dir ./data/search_r1/training_data --prefix_type search_r1
+python Search-R1/data_preprocess/search_r1.py --local_dir ./data/search_r1/training_data --prefix_type search_r1
 ```
 
 ### Step 4: perform model training
 ```bash
-bash ./examples/train/search_r1/train.sh
+bash ./Search-R1/train/search_r1/train_3b.sh
 ```
 
 For model format conversation and tensorboard visualization, refer to the following sections. 
@@ -191,7 +191,7 @@ if encounter error: "/lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.
 ```bash
 # Basic training command
 cd verl-tool
-bash examples/train/search_r1/train_search_r1_reproduce.sh
+bash Search-R1/train/search_r1/train_search_r1_reproduce.sh
 ```
 
 Note: by default wandb recording is disabled. To activate it, modify this line in `train_search_r1_reproduce.sh`:
@@ -241,7 +241,7 @@ Their wandb training report is [here](https://wandb.ai/lingchang-ustc/search_asy
 | 150            | 0.378   | 0.528      | 0.221            | 0.377 | 0.250      | 0.104       | 0.061     |
 | 200            | 0.388   | 0.540      | 0.253            | 0.383 | 0.267      | 0.136       | 0.057     |
 
-Our implementation's training record is provided as `verl-tool/examples/train/search_r1/reimplementation_tensorboard_records.0`. To view the results on tensorboard, run:
+Our implementation's training record is provided as `verl-tool/Search-R1/train/search_r1/reimplementation_tensorboard_records.0`. To view the results on tensorboard, run:
 
 ```bash
 tensorboard --logdir <folder_to_tensorboard_report>
