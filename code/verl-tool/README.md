@@ -160,3 +160,50 @@ We thank [Netmind.AI](https://www.netmind.ai/), [SeaAI Lab](https://sail.sea.com
   year={2025}
 }
 ```
+
+## A800 Search-R1 Retriever Service
+
+The Search-R1 retriever runs inside the `verl` Docker container on the A800
+machine. The verified launch script and resources are:
+
+```text
+Launch script: /ssd2/chengmingquan/Search-R1/retrieval_launch.sh
+FAISS index:   /ssd2/data/NQ_dataset/e5_Flat.index
+Corpus:        /ssd2/data/NQ_dataset/wiki-18.jsonl
+E5 model:      /ssd2/llm_models/e5-base-v2
+Endpoint:      http://127.0.0.1:8181
+Log:           /tmp/retriever.log
+```
+
+The image already contains PyTorch, Transformers and the CUDA 12 FAISS GPU
+package. Verify it with:
+
+```bash
+docker exec verl python -c \
+  'import faiss; print(faiss.get_num_gpus())'
+```
+
+The result should be `8`. Start the service detached from the Docker exec
+session; starting it as a foreground child of a short-lived `docker exec` will
+terminate it when that session closes:
+
+```bash
+docker exec -d verl bash -lc \
+  'cd /ssd2/chengmingquan/Search-R1 && nohup bash ./retrieval_launch.sh \
+   >/tmp/retriever.log 2>&1 < /dev/null'
+```
+
+The first startup loads approximately 61 GB of FAISS index and 14 GB of corpus,
+so port 8181 may remain closed for several minutes. Do not start a second copy
+while `pgrep -af retrieval_server.py` shows the existing process. Readiness is
+confirmed only by a successful request:
+
+```bash
+docker exec verl bash -lc \
+  'curl -sS -X POST http://127.0.0.1:8181/retrieve \
+   -H "Content-Type: application/json" \
+   -d "{\"queries\":[\"What is Python?\"],\"topk\":1}"'
+```
+
+See `docs/search-r1-retriever-a800.md` for the full startup, monitoring,
+shutdown, dependency and troubleshooting procedure.
