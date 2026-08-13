@@ -37,6 +37,30 @@ budgets can be overridden with environment variables.
 The model path is case-sensitive: the verified server path is
 `/ssd2/llm_models/Qwen3-1.7B`.
 
+## Retriever Service
+
+Search-R1 uses the retriever service from `/ssd2/chengmingquan/Search-R1/retrieval_launch.sh`
+inside the `verl` Docker container. Its configured resources are:
+
+- FAISS index: `/ssd2/data/NQ_dataset/e5_Flat.index`
+- Corpus: `/ssd2/data/NQ_dataset/wiki-18.jsonl`
+- E5 model: `/ssd2/llm_models/e5-base-v2`
+- Endpoint: `http://127.0.0.1:8181`
+
+The service must be launched detached from the Docker exec session because the
+initialization loads a 61 GB FAISS index and a 14 GB corpus. A verified launch is:
+
+```bash
+docker exec -d verl bash -lc \
+  'cd /ssd2/chengmingquan/Search-R1 && nohup bash ./retrieval_launch.sh \
+   >/tmp/retriever.log 2>&1 < /dev/null'
+```
+
+Check readiness with `pgrep -af retrieval_server.py` and a request to port 8181.
+The first startup can take several minutes; do not start a second copy while the
+first process is loading. The service was verified to start under the `verl`
+container; readiness must still be checked after every restart.
+
 ## Research protocol
 
 Motivation runs use NQ and HotpotQA to reduce turnaround time. Final claims must
