@@ -1,36 +1,45 @@
 # Search-OPD
 
-Search-OPD studies whether Search-R1-style reinforcement learning can use a much larger training corpus more effectively by training data-specialized search-policy teachers and consolidating them into one student with online policy distillation (OPD).
+Search-OPD studies whether data-specialized Search-R1 reinforcement-learning
+teachers can be consolidated into one deployable student with online policy
+distillation (OPD).
 
-## Research question
+## Current setup
 
-Given a Search-R1 corpus of roughly 19M examples and a sub-7B base model, does
+- Runtime: `verlai/verl:vllm011.latest` Docker container
+- Hardware: 8 x NVIDIA A800-SXM4 80 GB
+- Default model: `/ssd2/llm_models/Qwen3-1.7B`
+- Training entry point: `code/verl-tool/scripts/Search-R1/train.sh`
+- Optimizer: Muon with automatic AdamW fallback for non-matrix parameters
+- Tracking: console plus SwanLab
+- Default quick evaluation: NQ (single-hop) and HotpotQA (multi-hop)
 
-```text
-partition data -> RL-train K specialized teachers -> OPD into one student
+## Data
+
+Data is kept under `data/search_r1/`. Training and test splits are separated and
+the dataset-specific test files are preferred for evaluation. See
+`data/search_r1/MANIFEST.md` for source revisions, hashes, row counts, and the
+train/test overlap audit.
+
+## Running
+
+From the repository's `code/verl-tool/scripts/Search-R1` directory:
+
+```bash
+bash train.sh
 ```
 
-outperform direct RL on the complete corpus under matched model size and, ideally, matched end-to-end compute?
+The script validates the model and training paths, starts from its own directory,
+and writes a timestamped `.log` file there while streaming the same output to the
+console. Paths, batch sizes, rollout count, GPU count, SwanLab project, and other
+budgets can be overridden with environment variables.
 
-## Working name
+The model path is case-sensitive: the verified server path is
+`/ssd2/llm_models/Qwen3-1.7B`.
 
-**Search-OPD: Scaling Search Reinforcement Learning through Data-Specialized Online Policy Distillation**
+## Research protocol
 
-## Planned comparisons
-
-- Full-data Search-R1 RL (primary baseline)
-- Full-data RL across multiple seeds
-- Random data shards + OPD
-- Task/ability shards + OPD
-- Difficulty/search-behavior shards + OPD
-- Single-teacher self-distillation and supervised trajectory distillation
-
-The main sweep is `K in {2, 4, 8}`. All claims must report student size, rollout count, distilled tokens, teacher cost, search/API calls, and total GPU/FLOPs budget.
-
-## Evaluation
-
-Report answer accuracy (EM/F1), multi-hop and difficulty-stratified results, out-of-distribution generalization, evidence quality, search turns, invalid-query rate, and accuracy per search cost. Use a held-out validation split, a strictly untouched test split, and at least three random seeds for headline comparisons.
-
-## Status
-
-This directory currently contains the research specification. Training code, configs, checkpoints, and logs should be added only with reproducible commands and budget metadata.
+Motivation runs use NQ and HotpotQA to reduce turnaround time. Final claims must
+restore all held-out datasets, include random-shard controls, preserve train/
+validation/test separation, and report mean and variance across at least three
+seeds with matched student and end-to-end compute budgets.

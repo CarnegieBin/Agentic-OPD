@@ -15,7 +15,7 @@ VerlTool: A unified and easy-to-extend tool-agent training framework based on ve
 | 
 <a href="https://arxiv.org/abs/2509.01055"><b>Paper</b></a> |
 <a href="https://github.com/TIGER-AI-Lab/verl-tool/blob/main/assets/docs/install.md"><b>Quick Start</b></a> |
-  <a href="Search-R1/train/search_r1"><b>Search-R1 Training Recipe</b></a> |
+  <a href="scripts/Search-R1/train.sh"><b>Search-R1 Training Recipe</b></a> |
   <a href="https://deepwiki.com/TIGER-AI-Lab/verl-tool"><b>DeepWiki</b></a> |
   <a href="assets/imgs/wechat_group.jpg"><b>WeChat Group</b></a> |
   <a href="https://discord.gg/kZggJmaz"><b>Discord</b></a>
@@ -31,7 +31,7 @@ VerlTool: A unified and easy-to-extend tool-agent training framework based on ve
 + [2026/05/01] 🏆 Our paper received the **Best Paper Award** at [**ICLR 2026 SPOT**](https://spoticlr.github.io/)!
 + [2025/11/10] VerlTool has re-organized its codebase to improve modularity and maintainability, supporting to the latest verl (`0.6.0`) and vllm (`0.11.0`) versions. Please refer to the [verl-tool v0.6.0.dev Upgrade Notes](/assets/docs/updates/verltool_v0.6.0_upgrade.md) for more details.
 + [2025/09/02] VerlTool's tech report is out! See on [Hugging Face Daily Paper](https://huggingface.co/papers/2509.01055)!
-+ [2025/06/30] We reproduce Search-R1 with even higher performance on the same benchmarks! See [PR](https://github.com/TIGER-AI-Lab/verl-tool/pull/71) and training [README](Search-R1/train/search_r1/README.md) for more details.
++ [2025/06/30] We reproduce Search-R1 with even higher performance on the same benchmarks! See [PR](https://github.com/TIGER-AI-Lab/verl-tool/pull/71) and training [script](scripts/Search-R1/train.sh) for more details.
 + [2025/06/28] We support NL2SQL tool RL training. See NL2SQL [README](https://github.com/TIGER-AI-Lab/verl-tool/tree/main/examples/train/skysql) for more details.
 + [2025/06/26] We support DAPO recipe training. See [DAPO.md](./assets/docs/DAPO.md) for more details.
 + [2025/06/18] VerlTool now officially supports Trajectory-Level asynchronous, speeding up the rollout generation with tool calling by at least 2x! see [asyncRL.md](./assets/docs/asyncRL.md) for more details.
