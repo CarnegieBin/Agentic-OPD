@@ -120,6 +120,74 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+
+
+def _coerce_agent_loop_metrics(metrics: Any) -> AgentLoopMetrics:
+    """Convert metrics from an upstream or custom agent-loop model."""
+    if isinstance(metrics, AgentLoopMetrics):
+        return metrics
+    if hasattr(metrics, "model_dump"):
+        metrics = metrics.model_dump()
+    return AgentLoopMetrics.model_validate(metrics)
+
+
+def _as_2d_long_tensor(value: Any) -> torch.Tensor:
+    """Normalize tokenizer output to a two-dimensional long tensor."""
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=torch.long)
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1, 1)
+    elif tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected a scalar, vector, or matrix; got shape {tuple(tensor.shape)}")
+    return tensor.to(dtype=torch.long)
+
+
+def _pad_single_sequence(
+    tokenizer: AutoTokenizer,
+    values: list[int],
+    *,
+    max_length: int,
+    padding_side: str,
+    pad_value: int,
+    return_attention_mask: bool,
+) -> dict[str, torch.Tensor]:
+    """Pad one token sequence while handling empty tokenizer inputs.
+
+    Hugging Face tokenizers return a Python list for ``pad({"input_ids": []})``
+    even when ``return_tensors="pt"`` is requested.  Rollouts can legitimately
+    contain an empty completion, so construct that case explicitly and
+    normalize the regular path as well.
+    """
+    values = list(values)
+    max_length = int(max_length)
+    if not values:
+        output = {
+            "input_ids": torch.full(
+                (1, max_length),
+                int(pad_value),
+                dtype=torch.long,
+            )
+        }
+        if return_attention_mask:
+            output["attention_mask"] = torch.zeros((1, max_length), dtype=torch.long)
+        return output
+
+    tokenizer.padding_side = padding_side
+    output = tokenizer.pad(
+        {"input_ids": values},
+        padding="max_length",
+        max_length=max_length,
+        return_tensors="pt",
+        return_attention_mask=return_attention_mask,
+    )
+    output["input_ids"] = _as_2d_long_tensor(output["input_ids"])
+    if return_attention_mask:
+        attention_mask = output.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(output["input_ids"])
+        output["attention_mask"] = _as_2d_long_tensor(attention_mask)
+    return output
     
     
 
@@ -530,6 +598,30 @@ class AgentLoopWorker:
             kwargs["validate"] = trajectory["validate"]
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
+            if os.environ.get("SEARCH_R1_PRINT_TRAJECTORIES", "0") == "1":
+                prompt_text = self.tokenizer.decode(
+                    output.prompt_ids,
+                    skip_special_tokens=False,
+                )
+                response_text = self.tokenizer.decode(
+                    output.response_ids,
+                    skip_special_tokens=False,
+                )
+                mask = list(output.response_mask)
+                print(
+                    "\n"
+                    f"[Search-R1 trajectory] validate={trajectory['validate']} "
+                    f"step={trajectory['step']} sample_index={trajectory['sample_index']} "
+                    f"rollout_n={trajectory['rollout_n']} "
+                    f"response_tokens={len(output.response_ids)} "
+                    f"trainable_tokens={sum(mask)} observation_tokens={len(mask) - sum(mask)}\n"
+                    f"[prompt]\n{prompt_text}\n"
+                    f"[response]\n{response_text}\n"
+                    f"[response_mask]\n{mask}\n"
+                    "[/Search-R1 trajectory]",
+                    flush=True,
+                )
+
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
@@ -549,39 +641,36 @@ class AgentLoopWorker:
             # - position_ids: sequential positions for tokens, starting at 0
             #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
-            self.tokenizer.padding_side = "left"
-            prompt_output = self.tokenizer.pad(
-                {"input_ids": output.prompt_ids},
-                padding="max_length",
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.tokenizer.eos_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+
+            prompt_output = _pad_single_sequence(
+                self.tokenizer,
+                output.prompt_ids,
                 max_length=self.config.actor_rollout_ref.rollout.prompt_length,
-                return_tensors="pt",
+                padding_side="left",
+                pad_value=pad_token_id,
                 return_attention_mask=True,
             )
-            if prompt_output["input_ids"].dim() == 1:
-                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
-
-            self.tokenizer.padding_side = "right"
-            response_output = self.tokenizer.pad(
-                {"input_ids": output.response_ids},
-                padding="max_length",
+            response_output = _pad_single_sequence(
+                self.tokenizer,
+                output.response_ids,
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
-                return_tensors="pt",
+                padding_side="right",
+                pad_value=pad_token_id,
                 return_attention_mask=True,
             )
-            if response_output["input_ids"].dim() == 1:
-                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
-
-            response_mask_output = self.tokenizer.pad(
-                {"input_ids": output.response_mask},
-                padding="max_length",
+            response_mask_output = _pad_single_sequence(
+                self.tokenizer,
+                output.response_mask,
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
-                return_tensors="pt",
+                padding_side="right",
+                pad_value=0,
                 return_attention_mask=False,
             )
-            if response_mask_output["input_ids"].dim() == 1:
-                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
             response_logprobs = None
             if output.response_logprobs is not None:
@@ -681,6 +770,11 @@ class AgentLoopWorker:
                 result = await self.reward_manager_worker.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
                 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+
+            # Agent loops loaded from the upstream verl registry return the
+            # upstream AgentLoopMetrics class.  Normalize it at this boundary
+            # before constructing verl_tool's internal output model.
+            metrics = _coerce_agent_loop_metrics(output.metrics)
                 
             return _InternalAgentLoopOutput(
                 prompt_ids=prompt_output["input_ids"],
@@ -694,7 +788,7 @@ class AgentLoopWorker:
                 multi_modal_data=output.multi_modal_data,
                 reward_score=output.reward_score,
                 num_turns=output.num_turns,
-                metrics=output.metrics,
+                metrics=metrics,
                 extra_fields=output.extra_fields,
             )
 

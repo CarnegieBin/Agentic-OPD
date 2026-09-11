@@ -193,6 +193,10 @@ docker exec -d verl bash -lc \
    >/tmp/retriever.log 2>&1 < /dev/null'
 ```
 
+The service has been verified in the `verl` container: PID `2587285` returned
+HTTP 200 for a live `/retrieve` request on 2026-08-13. The container runs with
+`NetworkMode=host`, so `127.0.0.1:8181` is reachable identically from inside the
+container and from the A800 host, and no published Docker port mapping exists.
 The first startup loads approximately 61 GB of FAISS index and 14 GB of corpus,
 so port 8181 may remain closed for several minutes. Do not start a second copy
 while `pgrep -af retrieval_server.py` shows the existing process. Readiness is
@@ -202,8 +206,34 @@ confirmed only by a successful request:
 docker exec verl bash -lc \
   'curl -sS -X POST http://127.0.0.1:8181/retrieve \
    -H "Content-Type: application/json" \
-   -d "{\"queries\":[\"What is Python?\"],\"topk\":1}"'
+   -d "{\"queries\":[\"What is Python?\"],\"topk\":1,\"return_scores\":true}"'
 ```
 
+The verified response contains a Python document with score
+`0.8638745546340942`. Each element of `result` is one list per query holding
+`{"document": {"id", "contents"}, "score"}` entries. Keep `return_scores: true`
+with this server revision; omitting it returns HTTP 500 during result unpacking
+(reconfirmed 2026-08-13). Omitting `topk` falls back to the server default of 3.
+
+Measured in-container throughput: 64 single-query `topk: 3` requests across 32
+threads all returned 200 in 1.12 s (about 57 QPS, p95 0.580 s).
+`scripts/Search-R1/train.sh` passes `$RETRIEVER_URL` to the search tool.
+
+The diagnostic launcher trains on the complete training parquet and validates
+against the NQ and HotpotQA files under `data/search_r1/test/`. This makes
+checkpoint selection test-informed, so these metrics must not be reported as
+held-out generalization. The run uses GRPO with five training rollouts per
+prompt and one deterministic rollout per validation example. The default
+actor optimizer is `muon.SearchOPDMuon` under FSDP2; eligible logical 2-D
+transformer weights use Muon while embeddings, heads, vectors, norms, and
+adapters use its AdamW backup path. Run final test evaluation separately after
+checkpoint selection. Checkpoints are placed in an optimizer-qualified subdirectory under
+`/ssd1/tcbian/Search-OPD/` so AdamW and Muon artifacts cannot be mixed.
+The Search-R1 launcher starts from scratch, retains every periodic checkpoint,
+and appends per-dataset solved UID coverage for each checkpoint to
+`validation_checkpoint_metrics.jsonl`. Complete per-sample validation
+trajectories are written by step and data source under
+`validation_trajectories/global_step_<step>/`.
+
 See `docs/search-r1-retriever-a800.md` for the full startup, monitoring,
-shutdown, dependency and troubleshooting procedure.
+verified API behaviour, shutdown, dependency and troubleshooting procedure.

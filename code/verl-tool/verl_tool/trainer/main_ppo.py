@@ -295,6 +295,24 @@ class TaskRunner:
         # Create training and validation datasets.
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        test_datasets = {}
+        test_files = config.data.get("test_files", {})
+        if test_files:
+            test_files = OmegaConf.to_container(test_files, resolve=True)
+            if isinstance(test_files, (str, list)):
+                test_files = {"test": test_files}
+            for data_source, data_paths in test_files.items():
+                if data_paths in (None, "", []):
+                    continue
+                test_datasets[str(data_source)] = create_rl_dataset(
+                    data_paths,
+                    config.data,
+                    tokenizer,
+                    processor,
+                    is_train=False,
+                    max_samples=config.data.get("test_max_samples", -1),
+                )
+            print(f"Loaded independent test datasets: {list(test_datasets)}")
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -309,6 +327,7 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            test_datasets=test_datasets,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
@@ -319,7 +338,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples=None):
     """Create a dataset.
 
     Arguments:
@@ -357,12 +376,28 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         dataset_cls = RLHFDataset
     print(f"Using dataset class: {dataset_cls.__name__}")
 
+    # Validation sampling must follow validation_shuffle rather than the
+    # training shuffle setting. This matters when max_samples selects a fixed
+    # checkpoint-selection subset.
+    dataset_config = OmegaConf.merge(
+        data_config,
+        {
+            "shuffle": data_config.get("shuffle", True)
+            if is_train
+            else data_config.get("validation_shuffle", False)
+        },
+    )
+
     # Instantiate the dataset using the determined dataset class
+    if max_samples is None:
+        max_samples = data_config.get("train_max_samples", -1) if is_train else data_config.get("val_max_samples", -1)
+
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
-        config=data_config,
+        config=dataset_config,
+        max_samples=max_samples,
     )
 
     return dataset
@@ -412,4 +447,3 @@ def create_rl_sampler(data_config, dataset):
 
 if __name__ == "__main__":
     main()
-

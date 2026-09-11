@@ -42,6 +42,21 @@ class AgentState(Enum):
     INTERACTING = "interacting"
 
 
+SEARCH_R1_ACTION_ENDINGS = ("</search>", "</answer>")
+SEARCH_R1_FORBIDDEN_OUTPUT = "<information>"
+
+
+def _find_token_subsequence(tokens: list[int], needle: list[int]) -> int:
+    """Return the first token offset of ``needle`` in ``tokens``."""
+    if not needle or len(needle) > len(tokens):
+        return -1
+    width = len(needle)
+    for start in range(len(tokens) - width + 1):
+        if tokens[start : start + width] == needle:
+            return start
+    return -1
+
+
 class AgentData:
     """Encapsulates all state variables for the agent loop."""
 
@@ -72,6 +87,11 @@ class AgentData:
         self.tool_rewards: list[float] = []
         self.user_turns = 0
         self.assistant_turns = 0
+        # Search-R1 counts search and answer as actions.  The count is
+        # cumulative across incremental generations; tool observations never
+        # increment it.
+        self.action_count = 0
+        self.last_action = None
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
@@ -91,6 +111,14 @@ class ToolAgentLoop(AgentLoopBase):
         cls.processor = processor
         cls.max_user_turns = config.actor_rollout_ref.rollout.multi_turn.max_user_turns
         cls.max_assistant_turns = config.actor_rollout_ref.rollout.multi_turn.max_assistant_turns
+        cls.max_generated_response_length = (
+            config.actor_rollout_ref.rollout.multi_turn.max_generated_response_length
+            or config.actor_rollout_ref.rollout.response_length
+        )
+        cls.max_response_length_per_turn = (
+            config.actor_rollout_ref.rollout.multi_turn.max_response_length_per_turn
+            or cls.max_generated_response_length
+        )
         cls.max_parallel_calls = config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
@@ -100,13 +128,34 @@ class ToolAgentLoop(AgentLoopBase):
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
-        print(f"Initialized tools: {cls.tools}")
-
+        cls.search_r1_format = cls.tool_parser_name == "search_r1"
+        cls.search_r1_max_obs_length = int(config.data.get("max_obs_length", 500))
+        multi_turn_config = config.actor_rollout_ref.rollout.multi_turn
+        configured_stop_tokens = multi_turn_config.get("stop_tokens", None)
+        cls.search_r1_stop_strings = list(
+            configured_stop_tokens or list(SEARCH_R1_ACTION_ENDINGS) + [SEARCH_R1_FORBIDDEN_OUTPUT]
+        )
+        cls.search_r1_include_stop_str_in_output = bool(
+            multi_turn_config.get("include_stop_str_in_output", True)
+        )
+        cls.search_r1_stop_token_ids = {
+            marker: cls.tokenizer.encode(marker, add_special_tokens=False)
+            for marker in cls.search_r1_stop_strings
+        }
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.actor_rollout_ref.rollout.response_length
         cls.system_prompt = tokenizer.apply_chat_template(
             [{}], add_generation_prompt=False, tokenize=True, **cls.apply_chat_template_kwargs
+        )
+        print(
+            "Initialized Search-R1 ToolAgentLoop: "
+            f"trajectory_length={cls.response_length}, "
+            f"max_response_length_per_turn={cls.max_response_length_per_turn}, "
+            f"max_generated_response_length={cls.max_generated_response_length}, "
+            f"max_obs_length={cls.search_r1_max_obs_length}, "
+            f"max_assistant_turns={cls.max_assistant_turns}, "
+            f"tools={list(cls.tools)}"
         )
         # Initialize interactions from config file
         cls.interaction_config_file = config.actor_rollout_ref.rollout.multi_turn.interaction_config_path
@@ -162,9 +211,12 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
-        # Finalize output
-        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
-        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        # Finalize output.  Keep the prompt separate even when the model
+        # returned an empty completion (``-0`` would otherwise duplicate it).
+        prompt_ids, response_ids = self._split_prompt_and_response(
+            agent_data.prompt_ids,
+            agent_data.response_mask,
+        )
         multi_modal_data = {"image": agent_data.image_data} if agent_data.image_data is not None else {}
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -176,21 +228,25 @@ class ToolAgentLoop(AgentLoopBase):
             else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
-            extra_fields={},
+            extra_fields={
+                "action_count": agent_data.action_count,
+                "last_action": agent_data.last_action,
+            },
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        template_kwargs = {} if self.search_r1_format else {"tools": self.tool_schemas}
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
                     add_generation_prompt=True,
                     tokenize=False,
+                    **template_kwargs,
                     **self.apply_chat_template_kwargs,
                 ),
             )
@@ -201,13 +257,118 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.tokenizer.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
                     add_generation_prompt=True,
                     tokenize=True,
+                    **template_kwargs,
                     **self.apply_chat_template_kwargs,
                 ),
             )
         return AgentState.GENERATING
+
+    def _truncate_search_r1_generation(
+        self, token_ids: list[int], log_probs: Optional[list[float]]
+    ) -> tuple[list[int], Optional[list[float]], Optional[str]]:
+        """Keep the first complete action from this incremental generation.
+
+        ``output.token_ids`` contains only the newly generated tokens.  The
+        previous actions and observations remain in ``prompt_ids``, so the
+        first action in this chunk is the next cumulative action (the k-th
+        action on the k-th action-producing generation).
+        """
+        if not self.search_r1_format or not token_ids:
+            return token_ids, log_probs, None
+
+        first_match: tuple[int, str] | None = None
+        for marker, marker_ids in self.search_r1_stop_token_ids.items():
+            start = _find_token_subsequence(token_ids, marker_ids)
+            if start < 0:
+                continue
+            if first_match is None or start < first_match[0]:
+                first_match = (start, marker)
+
+        if first_match is None:
+            # BPE tokenization is context-sensitive. For example, Qwen2.5
+            # encodes standalone ``</search>`` differently from the same text
+            # after a space. Fall back to decoded text and map the first marker
+            # back to an original token boundary.
+            decoded = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+            decoded_matches = [
+                (decoded.find(marker), marker)
+                for marker in self.search_r1_stop_strings
+                if decoded.find(marker) >= 0
+            ]
+            if not decoded_matches:
+                return token_ids, log_probs, None
+
+            char_start, marker = min(decoded_matches, key=lambda item: item[0])
+            if marker == SEARCH_R1_FORBIDDEN_OUTPUT:
+                cutoff = 0
+                for end in range(1, len(token_ids) + 1):
+                    if len(self.tokenizer.decode(token_ids[:end], skip_special_tokens=False)) > char_start:
+                        break
+                    cutoff = end
+                return (
+                    token_ids[:cutoff],
+                    log_probs[:cutoff] if log_probs is not None else None,
+                    "invalid_information",
+                )
+
+            char_end = char_start + len(marker)
+            decoded_prefix_ids = self.tokenizer.encode(decoded[:char_end], add_special_tokens=False)
+            if token_ids[: len(decoded_prefix_ids)] == decoded_prefix_ids:
+                cutoff = len(decoded_prefix_ids)
+            else:
+                cutoff = len(token_ids)
+                for end in range(1, len(token_ids) + 1):
+                    prefix = self.tokenizer.decode(token_ids[:end], skip_special_tokens=False)
+                    if len(prefix) >= char_end and marker in prefix:
+                        cutoff = end
+                        break
+            action = "search" if marker == "</search>" else "answer"
+            return (
+                token_ids[:cutoff],
+                log_probs[:cutoff] if log_probs is not None else None,
+                action,
+            )
+
+        start, marker = first_match
+        if marker == SEARCH_R1_FORBIDDEN_OUTPUT:
+            end = start
+            action = "invalid_information"
+        else:
+            end = start + len(self.search_r1_stop_token_ids[marker])
+            action = "search" if marker == "</search>" else "answer"
+
+        return token_ids[:end], log_probs[:end] if log_probs is not None else None, action
+
+    @staticmethod
+    def _generated_response_length(agent_data: AgentData) -> int:
+        """Count model-generated tokens; observations carry mask value zero."""
+        return sum(agent_data.response_mask)
+
+    @staticmethod
+    def _split_prompt_and_response(
+        prompt_ids: list[int], response_mask: list[int]
+    ) -> tuple[list[int], list[int]]:
+        """Split accumulated ids without treating ``-0`` as a slice.
+
+        An empty model generation is valid, for example when the inference
+        server returns an empty completion.  ``prompt_ids[-0:]`` would return
+        the entire prompt and contaminate the response.
+        """
+        response_length = len(response_mask)
+        if response_length > len(prompt_ids):
+            raise ValueError(
+                "Response mask is longer than the accumulated prompt: "
+                f"{response_length} > {len(prompt_ids)}"
+            )
+        split_index = len(prompt_ids) - response_length
+        return prompt_ids[:split_index], prompt_ids[split_index:]
+
+    @staticmethod
+    def _format_search_r1_observation(observation: str) -> str:
+        """Format an official Search-R1 continuation without model-specific chat tokens."""
+        return f"\n\n<information>{observation}</information>\n\n"
 
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
@@ -215,23 +376,57 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
+        # Keep this Search-R1-specific.  The manager can share the base
+        # sampling dictionary across concurrent requests.
+        generation_params = dict(sampling_params)
+        if self.search_r1_format:
+            remaining_generated_tokens = (
+                self.max_generated_response_length - self._generated_response_length(agent_data)
+            )
+            remaining_trajectory_tokens = self.response_length - len(agent_data.response_mask)
+            if remaining_generated_tokens <= 0 or remaining_trajectory_tokens <= 0:
+                return AgentState.TERMINATED
+            configured_max_tokens = generation_params.get("max_tokens")
+            if configured_max_tokens is None:
+                configured_max_tokens = remaining_generated_tokens
+            generation_params["max_tokens"] = min(
+                configured_max_tokens,
+                self.max_response_length_per_turn,
+                remaining_generated_tokens,
+                remaining_trajectory_tokens,
+            )
+            generation_params["stop"] = list(self.search_r1_stop_strings)
+            generation_params["include_stop_str_in_output"] = self.search_r1_include_stop_str_in_output
+
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=generation_params,
                 image_data=agent_data.image_data,
             )
 
+        response_ids, response_logprobs, action = self._truncate_search_r1_generation(
+            output.token_ids,
+            output.log_probs,
+        )
         agent_data.assistant_turns += 1
-        agent_data.response_ids = output.token_ids
+        agent_data.response_ids = response_ids
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
-        if output.log_probs:
-            agent_data.response_logprobs += output.log_probs
+        if response_logprobs:
+            agent_data.response_logprobs += response_logprobs
+        agent_data.last_action = action
+        if action in {"search", "answer"}:
+            agent_data.action_count += 1
 
         # Check termination conditions
-        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+        if not ignore_termination and (
+            len(agent_data.response_mask) >= self.response_length
+            or self._generated_response_length(agent_data) >= self.max_generated_response_length
+        ):
+            return AgentState.TERMINATED
+        if action in {"answer", "invalid_information"}:
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
@@ -239,7 +434,12 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
         # Extract tool calls
-        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        if self.search_r1_format and action == "search":
+            _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        elif not self.search_r1_format:
+            _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        else:
+            agent_data.tool_calls = []
 
         # Handle interaction if needed
         if self.interaction_config_file:
@@ -273,9 +473,32 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        for tool_response, tool_reward, tool_metrics in responses:
             # Create message from tool response
-            if tool_response.image or tool_response.video:
+            if self.search_r1_format:
+                if tool_metrics.get("invalid_search_query") or tool_metrics.get("repeated_search_query"):
+                    agent_data.metrics["search_r1/invalid_search_query"] = (
+                        agent_data.metrics.get("search_r1/invalid_search_query", 0) + 1
+                    )
+                    agent_data.tool_calls = []
+                    return AgentState.TERMINATED
+                # Search-R1 consumes plain passages. The generic tool text is a
+                # JSON envelope and may already be truncated by character count.
+                observation_text = (getattr(tool_response, "metadata", None) or {}).get("formatted_result")
+                if not observation_text:
+                    observation_text = tool_response.text or ""
+                    try:
+                        decoded_response = json.loads(observation_text)
+                        observation_text = decoded_response.get("result", observation_text)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                observation_ids = self.tokenizer.encode(observation_text, add_special_tokens=False)
+                observation = self.tokenizer.decode(observation_ids[: self.search_r1_max_obs_length])
+                message = {
+                    "role": "user",
+                    "content": self._format_search_r1_observation(observation),
+                }
+            elif tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
                 if not getattr(self.processor, "image_processor", None):
                     raise ValueError(
@@ -330,7 +553,12 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.messages.extend(add_messages)
         # Update prompt with tool responses
-        if self.processor is not None:
+        if self.search_r1_format:
+            information = "".join(message["content"] for message in add_messages)
+            response_ids = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.encode(information, add_special_tokens=False)
+            )
+        elif self.processor is not None:
             raw_tool_response = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -364,7 +592,18 @@ class ToolAgentLoop(AgentLoopBase):
                     lambda: self.tokenizer.apply_chat_template(add_messages, add_generation_prompt=True, tokenize=True),
                 )
                 response_ids = response_ids[len(self.system_prompt) :]
-        if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+        remaining_response_tokens = self.response_length - len(agent_data.response_mask)
+        if remaining_response_tokens <= 0:
+            return AgentState.TERMINATED
+        if len(response_ids) > remaining_response_tokens:
+            response_ids = response_ids[:remaining_response_tokens]
+            agent_data.metrics["search_r1/observation_truncated"] = (
+                agent_data.metrics.get("search_r1/observation_truncated", 0) + 1
+            )
+        agent_data.metrics["search_r1/observation_tokens"] = (
+            agent_data.metrics.get("search_r1/observation_tokens", 0) + len(response_ids)
+        )
+        if not response_ids:
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
         agent_data.prompt_ids += response_ids
@@ -452,7 +691,11 @@ class ToolAgentLoop(AgentLoopBase):
                 await tool.release(instance_id)
 
         tool_response_text = tool_execution_response.text
-        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
+        if (
+            tool_response_text
+            and self.max_tool_response_length > 0
+            and len(tool_response_text) > self.max_tool_response_length
+        ):
             if self.tool_response_truncate_side == "left":
                 tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
             elif self.tool_response_truncate_side == "right":

@@ -63,7 +63,9 @@ def process_single_row(row, current_split_name, row_index):
 
     # Build prompt structure
     user_content = user_content_prefix.rstrip("\n") + question
-    prompt = [{"role": "system", "content": system_content}, {"role": "user", "content": user_content}]
+    prompt = [{"role": "user", "content": user_content}]
+    if system_content:
+        prompt.insert(0, {"role": "system", "content": system_content})
 
     # Extract ground truth from reward_model or fallback to golden_answers
     reward_model_data = row.get("reward_model")
@@ -183,10 +185,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # System and user content configuration
-    system_content = DEFAULT_SYSTEM_CONTENT
     if args.prefix_type == "search_r1":
+        system_content = None
         user_content_prefix = SEARCH_R1_CONTENT_PREFIX
     else:
+        system_content = DEFAULT_SYSTEM_CONTENT
         user_content_prefix = DEFAULT_USER_CONTENT_PREFIX
 
     main()

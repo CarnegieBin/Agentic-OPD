@@ -14,7 +14,7 @@ from typing import Dict, Any
 from verl import DataProto
 from verl.workers.reward_manager.registry import register
 from .reward_score import _default_compute_score
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 def normalize_answer(s):
@@ -48,6 +48,35 @@ def em_check(prediction, golden_answers):
             score = 1
             break
     return score
+
+
+def token_f1(prediction, golden_answers):
+    """Return the best normalized token-level F1 over reference answers."""
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    prediction_tokens = normalize_answer(prediction).split()
+    if not prediction_tokens:
+        return 1.0 if any(not normalize_answer(answer).split() for answer in golden_answers) else 0.0
+
+    best_f1 = 0.0
+    prediction_counts = Counter(prediction_tokens)
+    for golden_answer in golden_answers:
+        target_tokens = normalize_answer(golden_answer).split()
+        if not target_tokens:
+            continue
+        overlap = sum((prediction_counts & Counter(target_tokens)).values())
+        if overlap == 0:
+            continue
+        precision = overlap / len(prediction_tokens)
+        recall = overlap / len(target_tokens)
+        best_f1 = max(best_f1, 2 * precision * recall / (precision + recall))
+    return best_f1
+
+
+def target_answers(ground_truth):
+    if isinstance(ground_truth, dict):
+        return ground_truth.get("target", ground_truth.get("answer", []))
+    return ground_truth
     
 
 def extract_solution(solution_str: str) -> str:
@@ -158,16 +187,17 @@ class SearchR1QAEMRewardManager:
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+            valid_response_length = int(
+                data_item.batch['attention_mask'][prompt_length:].sum().item()
+            )
+            valid_response_ids = data_item.batch['responses'][:valid_response_length]
 
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # Decode the full sequence
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
+            # The prompt intentionally contains an answer-tag example. Decode
+            # only the model response so that example cannot become a reward.
+            response_str = self.tokenizer.decode(
+                valid_response_ids,
+                skip_special_tokens=False,
+            )
 
             # Get ground truth
             if 'reward_model' in data_item.non_tensor_batch:
@@ -179,11 +209,15 @@ class SearchR1QAEMRewardManager:
 
             # Compute score
             score = compute_score(
-                solution_str=sequences_str, 
+                solution_str=response_str,
                 ground_truth=ground_truth, 
                 format_score=self.format_score,
                 score=self.score
             )
+            answer = extract_solution(response_str) or ""
+            answers = target_answers(ground_truth)
+            reward_extra_info["em"].append(float(em_check(answer, answers)))
+            reward_extra_info["f1"].append(float(token_f1(answer, answers)))
             if score > 0:
                 reward_extra_info['correct_response_length'].append(valid_response_length)
             else:
@@ -193,7 +227,8 @@ class SearchR1QAEMRewardManager:
             # update this score to the scores
             scores[i] = {"score": score}
 
-            reward_tensor[i, valid_response_length - 1] = score
+            if valid_response_length > 0:
+                reward_tensor[i, valid_response_length - 1] = score
 
             # Print examples for debugging
             data_source = data_item.non_tensor_batch.get('data_source', 'unknown')
@@ -205,7 +240,7 @@ class SearchR1QAEMRewardManager:
                 print(f"=== Search-R1 QA EM Reward Debug ===")
                 print(f"Data source: {data_source}")
                 print(f"Score: {score}")
-                print(f"Sequence: {sequences_str}")
+                print(f"Response: {response_str}")
                 print("=" * 50)
 
 
@@ -215,14 +250,16 @@ class SearchR1QAEMRewardManager:
                 # convert the length to a Python int
                 length_i = data[i].batch['attention_mask'][data[i].batch['prompts'].shape[-1]:].sum().item()
                 # subtract 1 because you want the last *valid* token
-                reward_tensor[i, length_i - 1] = score['score']
+                if length_i > 0:
+                    reward_tensor[i, length_i - 1] = score['score']
 
                 # reward_tensor[i, valid_response_length[i].item() - 1] = score['score']
                 for k, v in score.items():
                     reward_extra_info[k].append(v)
             else:
                 length_i = data[i].batch['attention_mask'][data[i].batch['prompts'].shape[-1]:].sum().item()
-                reward_tensor[i, length_i - 1] = score
+                if length_i > 0:
+                    reward_tensor[i, length_i - 1] = score
 
         correct_response_length_mean = np.mean(reward_extra_info['correct_response_length']) if reward_extra_info['correct_response_length'] else 0.0
         wrong_response_length_mean = np.mean(reward_extra_info['wrong_response_length']) if reward_extra_info['wrong_response_length'] else 0.0

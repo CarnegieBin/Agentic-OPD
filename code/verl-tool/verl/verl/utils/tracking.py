@@ -47,6 +47,19 @@ class Tracking:
         "file",
     ]
 
+    @staticmethod
+    def _prepare_swanlab_data(data: dict[str, Any], swanlab_module: Any) -> dict[str, Any]:
+        """Adapt text metadata for SwanLab without mutating shared metrics."""
+        prepared = dict(data)
+        for key, value in data.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                prepared[key] = swanlab_module.Text(value)
+        return prepared
+
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
@@ -153,7 +166,12 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = (
+                    self._prepare_swanlab_data(data, logger_instance)
+                    if default_backend == "swanlab"
+                    else data
+                )
+                logger_instance.log(data=backend_data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

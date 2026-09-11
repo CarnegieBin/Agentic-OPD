@@ -154,7 +154,14 @@ class RLHFDataset(Dataset):
         for parquet_file in self.data_files:
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            dataframe = self._normalize_schema(dataframe)
             dataframes.append(dataframe)
+        if not dataframes:
+            raise ValueError("No dataset files were provided")
+        # The optional raw metadata column has incompatible schemas across the
+        # NQ and HotpotQA shards (null vs. nested struct) and is not consumed by
+        # the RL prompt/reward pipeline.  It is removed in _normalize_schema so
+        # this also works with datasets versions without a ``promote`` option.
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         total = len(self.dataframe)
@@ -168,9 +175,40 @@ class RLHFDataset(Dataset):
             else:
                 indices = np.arange(self.max_samples)
             self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {total}")
+            selection = "random" if self.shuffle else "leading"
+            print(f"selected {self.max_samples} {selection} samples out of {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+
+    @staticmethod
+    def _normalize_schema(dataframe: datasets.Dataset) -> datasets.Dataset:
+        """Make heterogeneous Search-R1 parquet shards concatenable.
+
+        In particular, some shards store ``answers`` as a scalar string while
+        others store a list.  The verifier expects a list, so normalize both
+        common answer column names to ``list[str]`` before Arrow concatenation.
+        The source-only ``metadata`` column is dropped because its feature
+        schema differs between the NQ and HotpotQA shards.
+        """
+        if "metadata" in dataframe.column_names:
+            dataframe = dataframe.remove_columns("metadata")
+
+        answer_columns = [name for name in ("answers", "answer", "ground_truth") if name in dataframe.column_names]
+
+        def normalize(example):
+            for name in answer_columns:
+                value = example.get(name)
+                if value is None:
+                    example[name] = []
+                elif isinstance(value, (list, tuple)):
+                    example[name] = [str(item) for item in value]
+                else:
+                    example[name] = [str(value)]
+            return example
+
+        if answer_columns:
+            dataframe = dataframe.map(normalize, desc="Normalizing answer fields")
+        return dataframe
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

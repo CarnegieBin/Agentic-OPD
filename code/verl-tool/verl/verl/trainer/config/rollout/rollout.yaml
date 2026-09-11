@@ -153,6 +153,15 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
 
+  # Maximum model-generated tokens in one assistant turn.
+  # null falls back to the cumulative generated-token budget.
+  max_response_length_per_turn: null
+
+  # Maximum cumulative model-generated tokens across all assistant turns.
+  # Tool observations are stored in the response tensor but do not consume
+  # this budget. null falls back to rollout.response_length.
+  max_generated_response_length: null
+
   # null for no tool
   tool_config_path: null
 
@@ -162,8 +171,10 @@ multi_turn:
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 
-  # max length of tool response
-  max_tool_response_length: 256
+  # Maximum character length of a tool response before inserting a truncation
+  # marker. 0 disables this lossy character-level truncation; Search-R1
+  # applies the trajectory-capacity limit after tokenization instead.
+  max_tool_response_length: 0
 
   # truncate side of tool response: left, middle, right
   tool_response_truncate_side: middle

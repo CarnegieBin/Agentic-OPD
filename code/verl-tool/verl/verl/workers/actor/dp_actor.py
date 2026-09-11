@@ -83,13 +83,54 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    @staticmethod
+    def _selected_log_probs_from_logits(
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather log-probabilities for arbitrary token supports efficiently."""
+
+        if token_ids.ndim != logits.ndim:
+            raise ValueError(
+                "Token support rank must match logits rank: "
+                f"tokens={tuple(token_ids.shape)}, logits={tuple(logits.shape)}"
+            )
+        if token_ids.shape[:-1] != logits.shape[:-1]:
+            raise ValueError(
+                "Token support dimensions must match logits: "
+                f"tokens={tuple(token_ids.shape)}, logits={tuple(logits.shape)}"
+            )
+        if token_ids.dtype != torch.long:
+            token_ids = token_ids.to(dtype=torch.long)
+        if token_ids.numel() and (
+            token_ids.min() < 0 or token_ids.max() >= logits.shape[-1]
+        ):
+            raise ValueError(
+                f"Token support contains IDs outside vocabulary size {logits.shape[-1]}"
+            )
+        # log_softmax(logits)[token] = logits[token] - logsumexp(logits).
+        # Avoid materializing a second full-vocabulary probability tensor.
+        log_normalizer = torch.logsumexp(logits, dim=-1, keepdim=True)
+        return torch.gather(logits, dim=-1, index=token_ids) - log_normalizer
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        *,
+        opd_topk_token_ids=None,
+        opd_top_k=None,
+    ):
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+
+        When ``opd_top_k`` or ``opd_topk_token_ids`` is supplied, four values
+        are returned: ``(entropy, log_probs, support_log_probs, topk_ids)``.
+        The optional path is used by Search-OPD and is opt-in so unchanged
+        verl callers retain their original two-value API.
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -107,11 +148,70 @@ class DataParallelPPOActor(BasePPOActor):
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
+            return_opd = opd_topk_token_ids is not None or opd_top_k is not None
+            if opd_top_k is not None:
+                if isinstance(opd_top_k, bool):
+                    raise ValueError("opd_top_k must be an integer")
+                opd_top_k = int(opd_top_k)
+                if opd_top_k < 1:
+                    raise ValueError("opd_top_k must be positive")
+            if opd_topk_token_ids is not None:
+                if (
+                    opd_topk_token_ids.ndim != 3
+                    or tuple(opd_topk_token_ids.shape[:2])
+                    != (batch_size, response_length)
+                    or opd_topk_token_ids.shape[-1] < 1
+                ):
+                    raise ValueError(
+                        "opd_topk_token_ids must have shape "
+                        "[batch, response_length, top_k], "
+                        f"got {tuple(opd_topk_token_ids.shape)}"
+                    )
+                opd_topk_token_ids = opd_topk_token_ids.to(
+                    device=input_ids.device,
+                    dtype=torch.long,
+                )
+                if opd_top_k is not None and opd_topk_token_ids.shape[-1] != opd_top_k:
+                    raise ValueError(
+                        "Configured OPD top-k does not match supplied support: "
+                        f"configured={opd_top_k}, "
+                        f"supplied={opd_topk_token_ids.shape[-1]}"
+                    )
+                opd_top_k = int(opd_topk_token_ids.shape[-1])
+            support_log_probs = None
+            selected_topk_ids = None
+
             if self.use_remove_padding:
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # Map the dense response support to the unpadded model rows.
+                # ``indices`` indexes the original [batch, sequence] flattening
+                # and therefore remains valid after the scalar outputs are
+                # gathered back from sequence-parallel ranks.
+                support_ids_rmpad = None
+                if opd_topk_token_ids is not None:
+                    flat_indices = indices.to(device=input_ids.device, dtype=torch.long)
+                    row_batch = torch.div(flat_indices, seqlen, rounding_mode="floor")
+                    row_position = flat_indices.remainder(seqlen)
+                    response_start = seqlen - response_length - 1
+                    response_rows = (
+                        (row_position >= response_start)
+                        & (row_position < seqlen - 1)
+                    )
+                    row_response = row_position - response_start
+                    support_ids_rmpad = torch.zeros(
+                        (flat_indices.shape[0], opd_top_k),
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    if response_rows.any():
+                        support_ids_rmpad[response_rows] = opd_topk_token_ids[
+                            row_batch[response_rows],
+                            row_response[response_rows],
+                        ]
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
@@ -158,6 +258,13 @@ class DataParallelPPOActor(BasePPOActor):
                         position_ids_rmpad=None,
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
+                    if support_ids_rmpad is not None:
+                        support_ids_rmpad, _, _ = ulysses_pad_and_slice_inputs(
+                            support_ids_rmpad.transpose(0, 1),
+                            position_ids_rmpad=None,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                        support_ids_rmpad = support_ids_rmpad.transpose(0, 1)
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
@@ -176,6 +283,11 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                if return_opd and self.use_fused_kernels:
+                    raise ValueError(
+                        "Student Top-k OPD requires unfused model logits; "
+                        "set actor_rollout_ref.model.use_fused_kernels=false"
+                    )
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
@@ -183,6 +295,23 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+
+                    if opd_top_k is not None and opd_top_k > logits_rmpad.shape[-1]:
+                        raise ValueError(
+                            f"opd_top_k={opd_top_k} exceeds vocabulary size "
+                            f"{logits_rmpad.shape[-1]}"
+                        )
+                    if opd_topk_token_ids is not None:
+                        support_log_probs = self._selected_log_probs_from_logits(
+                            logits_rmpad,
+                            support_ids_rmpad,
+                        )
+                    if opd_top_k is not None:
+                        selected_topk_ids = torch.topk(
+                            logits_rmpad.detach(),
+                            k=opd_top_k,
+                            dim=-1,
+                        ).indices
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -219,6 +348,21 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if support_log_probs is not None:
+                        support_log_probs = gather_outputs_and_unpad(
+                            support_log_probs,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    if selected_topk_ids is not None:
+                        selected_topk_ids = gather_outputs_and_unpad(
+                            selected_topk_ids,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                            grad_scaler=False,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -233,6 +377,26 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if support_log_probs is not None:
+                    full_support_log_probs = pad_input(
+                        hidden_states=support_log_probs,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    support_log_probs = full_support_log_probs[
+                        :, -response_length - 1 : -1
+                    ]
+                if selected_topk_ids is not None:
+                    full_topk_ids = pad_input(
+                        hidden_states=selected_topk_ids,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    selected_topk_ids = full_topk_ids[
+                        :, -response_length - 1 : -1
+                    ]
 
                 # only return response part:
                 if calculate_entropy:
@@ -254,6 +418,11 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                if return_opd and self.use_fused_kernels:
+                    raise ValueError(
+                        "Student Top-k OPD requires unfused model logits; "
+                        "set actor_rollout_ref.model.use_fused_kernels=false"
+                    )
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -263,6 +432,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if opd_top_k is not None and opd_top_k > logits.shape[-1]:
+                        raise ValueError(
+                            f"opd_top_k={opd_top_k} exceeds vocabulary size "
+                            f"{logits.shape[-1]}"
+                        )
+                    if opd_topk_token_ids is not None:
+                        support_log_probs = self._selected_log_probs_from_logits(
+                            logits,
+                            opd_topk_token_ids,
+                        )
+                    if opd_top_k is not None:
+                        selected_topk_ids = torch.topk(
+                            logits.detach(),
+                            k=opd_top_k,
+                            dim=-1,
+                        ).indices
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -270,6 +455,8 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            if return_opd:
+                return entropy, log_probs, support_log_probs, selected_topk_ids
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -294,7 +481,13 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(
+        self,
+        data: DataProto,
+        calculate_entropy=False,
+        *,
+        opd_top_k=None,
+    ) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -320,6 +513,10 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        has_opd_support = "opd_topk_token_ids" in data.batch.keys()
+        return_opd = opd_top_k is not None or has_opd_support
+        if has_opd_support:
+            select_keys.append("opd_topk_token_ids")
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -332,13 +529,30 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        support_log_probs_lst = []
+        topk_ids_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
+                if return_opd:
+                    entropy, log_probs, support_log_probs, topk_ids = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        opd_topk_token_ids=model_inputs.get("opd_topk_token_ids"),
+                        opd_top_k=opd_top_k,
+                    )
+                    if support_log_probs is not None:
+                        support_log_probs_lst.append(support_log_probs)
+                    if topk_ids is not None:
+                        topk_ids_lst.append(topk_ids)
+                else:
+                    entropy, log_probs = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                    )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -352,7 +566,29 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if support_log_probs_lst:
+                support_log_probs_lst = [
+                    restore_dynamic_batch(
+                        torch.concat(support_log_probs_lst, dim=0),
+                        batch_idx_list,
+                    )
+                ]
+            if topk_ids_lst:
+                topk_ids_lst = [
+                    restore_dynamic_batch(
+                        torch.concat(topk_ids_lst, dim=0),
+                        batch_idx_list,
+                    )
+                ]
 
+        if return_opd:
+            support_log_probs = (
+                torch.concat(support_log_probs_lst, dim=0)
+                if support_log_probs_lst
+                else None
+            )
+            topk_ids = torch.concat(topk_ids_lst, dim=0) if topk_ids_lst else None
+            return log_probs, entropys, support_log_probs, topk_ids
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

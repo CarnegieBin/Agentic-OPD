@@ -120,7 +120,7 @@ class McoreOptimizerConfig(OptimizerConfig):
     override_optimizer_config: Optional[dict] = None
 
 
-def build_optimizer(parameters, config: FSDPOptimizerConfig):
+def build_optimizer(parameters, config: FSDPOptimizerConfig, *, named_parameters=None):
     """Build an optimizer based on the configuration.
 
     Dynamically imports and instantiates an optimizer class from the specified module.
@@ -128,6 +128,12 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
     Args:
         parameters: Model parameters to optimize
         config: FSDPOptimizerConfig with optimizer settings
+
+    Args:
+        named_parameters: Optional ``(name, parameter)`` iterable used by
+            optimizers that need parameter names for deterministic partitioning.
+            Ordinary optimizers continue to receive the original parameter
+            iterable unchanged.
 
     Returns:
         Optimizer instance
@@ -172,5 +178,13 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
             f"Optimizer '{config.optimizer}' not found in module '{config.optimizer_impl}'. "
             f"Available optimizers: {dir(module)}"
         ) from e
+
+    if getattr(optimizer_cls, "requires_named_parameters", False):
+        if named_parameters is None:
+            raise ValueError(
+                f"Optimizer {config.optimizer} requires named parameters, but the caller "
+                "provided only an unnamed parameter iterable."
+            )
+        parameters = named_parameters
 
     return optimizer_cls(parameters, **optimizer_args)

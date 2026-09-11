@@ -134,7 +134,7 @@ def _passages2string(retrieval_result):
         content = doc_item["document"]["contents"]
         title = content.split("\n")[0]
         text = "\n".join(content.split("\n")[1:])
-        format_reference += f"Doc {idx + 1} (Title: {title})\n{text}\n\n"
+        format_reference += f"Doc {idx + 1}(Title: {title}) {text}\n"
     return format_reference.strip()
 
 

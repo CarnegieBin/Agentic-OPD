@@ -158,3 +158,36 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+
+
+def flatten_evaluation_metrics(
+    data_src2var2metric2val: dict[str, dict[str, dict[str, float]]],
+    split: str,
+) -> dict[str, float]:
+    """Flatten source-grouped metrics without merging dataset namespaces.
+
+    ``split`` is deliberately part of the key so held-out validation metrics
+    and benchmark test metrics cannot overwrite each other in SwanLab.
+    """
+
+    if split not in {"val", "test"}:
+        raise ValueError(f"Unsupported evaluation split: {split}")
+
+    metric_dict: dict[str, float] = {}
+    for data_source, var2metric2val in data_src2var2metric2val.items():
+        core_var = "acc" if "acc" in var2metric2val else "reward"
+        for var_name, metric2val in var2metric2val.items():
+            if not metric2val:
+                continue
+            n_max = max(int(name.split("@")[-1].split("/")[0]) for name in metric2val)
+            for metric_name, metric_val in metric2val.items():
+                if (
+                    var_name == core_var
+                    and any(metric_name.startswith(prefix) for prefix in ("mean", "maj", "best"))
+                    and f"@{n_max}" in metric_name
+                ):
+                    metric_section = f"{split}-core"
+                else:
+                    metric_section = f"{split}-aux"
+                metric_dict[f"{metric_section}/{data_source}/{var_name}/{metric_name}"] = metric_val
+    return metric_dict

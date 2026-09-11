@@ -42,10 +42,20 @@ class SamplingConfig(BaseConfig):
 
 @dataclass
 class MultiTurnConfig(BaseConfig):
-    _mutable_fields = {"max_assistant_turns", "max_user_turns"}
+    _mutable_fields = {
+        "max_assistant_turns",
+        "max_user_turns",
+        "max_response_length_per_turn",
+        "max_generated_response_length",
+    }
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    # Maximum model-generated tokens in one assistant turn.
+    max_response_length_per_turn: Optional[int] = None
+    # Maximum cumulative model-generated tokens across all assistant turns.
+    # Tool observations do not consume this budget.
+    max_generated_response_length: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
@@ -54,6 +64,8 @@ class MultiTurnConfig(BaseConfig):
     interaction_config_path: Optional[str] = None
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
+    stop_tokens: Optional[list[str]] = None
+    include_stop_str_in_output: bool = False
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
 

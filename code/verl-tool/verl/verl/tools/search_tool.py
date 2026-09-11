@@ -200,6 +200,7 @@ class SearchTool(BaseTool):
         self._instance_dict[instance_id] = {
             "response": "",
             "reward": [],
+            "queries": [],
         }
         return instance_id, ToolResponse()
 
@@ -240,12 +241,40 @@ class SearchTool(BaseTool):
             tool_metrics: The metrics of the tool.
         """
         timeout = self.timeout
-        query_list_from_params = parameters.get("query_list")
+        query_list_from_params = parameters.get("query_list") if isinstance(parameters, dict) else None
 
-        if not query_list_from_params or not isinstance(query_list_from_params, list):
-            error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
+        if (
+            not isinstance(query_list_from_params, list)
+            or not query_list_from_params
+            or any(not isinstance(query, str) or not query.strip() for query in query_list_from_params)
+        ):
+            error_msg = (
+                "Error: 'query_list' must be a non-empty list of non-empty strings in parameters."
+            )
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
+
+        normalized_queries = [query.strip() for query in query_list_from_params]
+        invalid_placeholders = {"query", "search", "your query", "search query", "..."}
+        if any(query.casefold() in invalid_placeholders for query in normalized_queries):
+            error_msg = (
+                "Error: search query is a placeholder. Generate a specific query "
+                "from the question before searching."
+            )
+            logger.warning("[SearchTool] %s queries=%r", error_msg, normalized_queries)
+            return ToolResponse(text=error_msg), 0.0, {"invalid_search_query": True}
+
+        instance_state = self._instance_dict.get(instance_id)
+        previous_queries = instance_state.get("queries", []) if instance_state else []
+        if previous_queries and all(query.casefold() in previous_queries for query in normalized_queries):
+            error_msg = (
+                "Error: this search query was already used. Generate a different, "
+                "question-focused query or answer from the existing information."
+            )
+            logger.warning("[SearchTool] %s queries=%r", error_msg, normalized_queries)
+            return ToolResponse(text=error_msg), 0.0, {"repeated_search_query": True}
+        if instance_state is not None:
+            instance_state["queries"].extend(query.casefold() for query in normalized_queries)
 
         # Execute search using Ray execution pool
         try:

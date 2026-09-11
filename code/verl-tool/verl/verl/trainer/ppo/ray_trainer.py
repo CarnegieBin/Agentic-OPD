@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import random
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -605,6 +606,18 @@ class RayPPOTrainer:
 
             print("validation generation end")
 
+            # Validation only needs token ids, attention_mask, and metadata for
+            # decoding and EM. Do not retain training-only tokenwise tensors.
+            for key in (
+                "response_mask",
+                "response_logprobs",
+                "old_log_probs",
+                "ref_log_prob",
+                "entropys",
+            ):
+                if key in test_output_gen_batch.batch.keys():
+                    test_output_gen_batch.batch.pop(key)
+
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -926,6 +939,36 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
+    def _skip_train_dataloader_steps(self, num_steps: int) -> None:
+        """Advance a fresh dataloader to a deterministic resume position.
+
+        HF-only exports do not contain ``data.pt``.  When such an export is
+        resumed, the sampler is recreated with the configured seed and this
+        method advances it by the number of already-completed batches before
+        the training loop starts.
+        """
+        num_steps = int(num_steps)
+        if num_steps < 0:
+            raise ValueError(f"initial_data_steps must be non-negative, got {num_steps}")
+        if num_steps == 0:
+            return
+        if num_steps >= len(self.train_dataloader):
+            raise ValueError(
+                "initial_data_steps must be smaller than one dataloader epoch; "
+                f"got {num_steps} for {len(self.train_dataloader)} batches"
+            )
+
+        iterator = iter(self.train_dataloader)
+        for _ in range(num_steps):
+            next(iterator)
+        # Keep this iterator for the first resumed epoch. Recreating the
+        # loader here would advance RandomSampler's generator a second time.
+        self._resume_train_iterator = iterator
+        print(
+            f"Advanced training dataloader by {num_steps} batches "
+            f"(next update starts at global step {self.global_steps + 1})"
+        )
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1022,6 +1065,63 @@ class RayPPOTrainer:
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
 
+    def _print_random_reward_trajectory(self, batch, reward_extra_infos_dict):
+        """Print one random post-reward trajectory for every training step."""
+        if os.environ.get("SEARCH_R1_PRINT_STEP_TRAJECTORY", "1") != "1":
+            return
+        if "responses" not in batch.batch or "attention_mask" not in batch.batch:
+            return
+
+        responses = batch.batch["responses"]
+        attention_mask = batch.batch["attention_mask"]
+        response_mask = batch.batch.get("response_mask")
+        if responses.shape[0] == 0:
+            return
+
+        sample_index = random.randrange(responses.shape[0])
+        response_length = responses.shape[1]
+        sample_attention = attention_mask[sample_index].bool()
+        response_attention = sample_attention[-response_length:]
+        response_ids = responses[sample_index][response_attention]
+        full_ids = batch.batch["input_ids"][sample_index][sample_attention]
+        response_text = self.tokenizer.decode(
+            response_ids.detach().cpu().tolist(),
+            skip_special_tokens=False,
+        )
+        full_text = self.tokenizer.decode(
+            full_ids.detach().cpu().tolist(),
+            skip_special_tokens=False,
+        )
+
+        extra_info = {}
+        for key, values in (reward_extra_infos_dict or {}).items():
+            try:
+                if len(values) == responses.shape[0]:
+                    value = values[sample_index]
+                    extra_info[key] = value.item() if hasattr(value, "item") else value
+            except (TypeError, IndexError):
+                continue
+        mask_text = None
+        if response_mask is not None:
+            mask = response_mask[sample_index][response_attention].detach().cpu().tolist()
+            mask_text = (
+                f"trainable_tokens={sum(mask)} "
+                f"observation_tokens={len(mask) - sum(mask)}\n"
+                f"[response_mask]\n{mask}"
+            )
+
+        print(
+            "\n"
+            f"[Search-R1 reward trajectory] step={self.global_steps} "
+            f"sample_index={sample_index} score={extra_info.get('em', 'n/a')}\n"
+            f"[full_trajectory]\n{full_text}\n"
+            f"[response]\n{response_text}\n"
+            f"{mask_text + chr(10) if mask_text else ''}"
+            f"[reward_extra_info]\n{extra_info}\n"
+            "[/Search-R1 reward trajectory]",
+            flush=True,
+        )
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1040,10 +1140,16 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0
+        self.global_steps = int(self.config.trainer.get("initial_global_step", 0))
+        if self.global_steps < 0:
+            raise ValueError(f"initial_global_step must be non-negative, got {self.global_steps}")
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        initial_data_steps = int(self.config.trainer.get("initial_data_steps", 0))
+        if initial_data_steps > 0:
+            self._skip_train_dataloader_steps(initial_data_steps)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1076,7 +1182,12 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            train_iterator = getattr(self, "_resume_train_iterator", None)
+            if train_iterator is None:
+                train_iterator = self.train_dataloader
+            else:
+                del self._resume_train_iterator
+            for batch_dict in train_iterator:
                 metrics = {}
                 timing_raw = {}
 
@@ -1169,6 +1280,7 @@ class RayPPOTrainer:
                             )
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            self._print_random_reward_trajectory(batch, reward_extra_infos_dict)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):

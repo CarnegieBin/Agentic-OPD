@@ -37,6 +37,19 @@ defaults:
   # self config override anything above
   - _self_
 
+# Search-R1 benchmark files are evaluation-only and are never used for
+# validation-based checkpoint selection.
+data:
+
+  # Mapping from the expected data-source tag to one or more Parquet files.
+  test_files: {}
+
+  # Maximum number of examples loaded from each benchmark file.
+  test_max_samples: -1
+
+  # Batch size used by the independent benchmark evaluator.
+  test_batch_size: 8192
+
 # config for actor, rollout and reference model
 actor_rollout_ref:
 
@@ -150,6 +163,12 @@ trainer:
   # Total training steps (can be set explicitly or derived from epochs)
   total_training_steps: null
 
+  # Initial optimizer step used when resuming from an HF-only model export.
+  initial_global_step: 0
+
+  # Number of deterministic training batches to skip before the first update.
+  initial_data_steps: 0
+
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples
 
@@ -167,6 +186,9 @@ trainer:
 
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
+
+  # Retain a fixed held-out validation subset for checkpoint selection
+  validation_checkpoint_data: held_out_training_split
 
   # Number of nodes used in the training
   nnodes: 1
@@ -202,6 +224,19 @@ trainer:
   # Validation frequency (in training iterations)
   test_freq: -1
 
+  # Whether to evaluate the benchmark test files before training.
+  test_before_train: False
+
+  # Whether to evaluate the benchmark test files at the final training step.
+  test_after_train: True
+
+  # Optional independent benchmark evaluation frequency; -1 disables periodic
+  # test evaluation while retaining the final pass.
+  test_eval_freq: -1
+
+  # Optional directory for per-source benchmark generation dumps.
+  test_data_dir: null
+
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 
@@ -219,6 +254,9 @@ trainer:
 
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
+
+  # Maximum number of HF checkpoints retained by solved-validation-UID union
+  validation_checkpoint_keep_limit: 5
 
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300

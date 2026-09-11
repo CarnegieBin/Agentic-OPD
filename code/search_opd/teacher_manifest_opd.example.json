@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "base_model": "/ssd2/llm_models/Qwen2.5-3B-Instruct",
+  "dataset_revision": "PeterJinGo/nq_hotpotqa_train@main",
+  "teachers": [
+    {
+      "name": "global_step_30",
+      "path": "/ssd1/tcbian/Search-OPD/REPLACE_WITH_IMMUTABLE_RUN/global_step_30",
+      "step": 30,
+      "sha256": null
+    },
+    {
+      "name": "global_step_105",
+      "path": "/ssd1/tcbian/Search-OPD/REPLACE_WITH_IMMUTABLE_RUN/global_step_105",
+      "step": 105,
+      "sha256": null
+    }
+  ]
+}

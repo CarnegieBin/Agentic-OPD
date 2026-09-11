@@ -106,6 +106,33 @@ class HermesToolParser(ToolParser):
         return content, function_calls
 
 
+@ToolParser.register("search_r1")
+class SearchR1ToolParser(ToolParser):
+    """Parser for the original Search-R1 ``<search>query</search>`` action."""
+
+    def __init__(self, tokenizer) -> None:
+        super().__init__(tokenizer)
+        self.search_pattern = regex.compile(r"<search>\s*(.*?)\s*</search>", regex.DOTALL)
+
+    @rollout_trace_op
+    async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+        match = self.search_pattern.search(text)
+        if match is None or not match.group(1).strip():
+            return text, []
+
+        query = match.group(1).strip()
+        call = FunctionCall(
+            name="search",
+            arguments=json.dumps({"query_list": [query]}, ensure_ascii=False),
+        )
+        # Search-R1 is one action per generation.  A defensive count=1 keeps
+        # malformed multi-search output from becoming parallel tool calls if
+        # a backend ignores the configured stop string.
+        return self.search_pattern.sub("", text, count=1), [call]
+
+
 @ToolParser.register("gpt-oss")
 class GptOssToolParser(ToolParser):
     """
