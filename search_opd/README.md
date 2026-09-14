@@ -1,6 +1,6 @@
 # Search-OPD 多教师训练
 
-这个目录是独立的 Search-R1 多教师 OPD 入口。`code/verl-tool` 中已有
+这个目录是独立的 Search-R1 多教师 OPD 入口。`verl-tool` 中已有
 代码不需要修改；本目录只包装现有的 dataset、Search agent、奖励函数、验证
 和 checkpoint 逻辑。
 
@@ -63,7 +63,7 @@ bash train.sh
 ```
 
 脚本中的训练集、验证集、rollout 数量、序列长度和 Search 工具与
-`code/verl-tool/scripts/Search-R1/train.sh` 保持一致。NQ/HotpotQA 仅用于
+`../verl-tool/scripts/Search-R1/train.sh` 保持一致。NQ/HotpotQA 仅用于
 教师调度和 validation；Bamboogle、Musique、TriviaQA 是独立 test
 dataloader，checkpoint 只按三个测试集 EM 的均值保留。
 
